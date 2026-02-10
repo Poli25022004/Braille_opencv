@@ -7,6 +7,7 @@
 #include <fstream>
 #include <cfloat>
 #include <cmath>
+
 using namespace cv;
 using namespace std;
 
@@ -36,32 +37,6 @@ int buildMask(int mat[3][2]) {
     return mask;
 }
 
-int decodeCellMask(const vector<Point2f>& points) {
-    int mat[3][2] = { 0 };
-    if (points.empty()) return -1;
-    float minX = points[0].x, maxX = points[0].x;
-    float minY = points[0].y, maxY = points[0].y;
-    for (const auto& p : points) {
-        minX = min(minX, p.x);
-        maxX = max(maxX, p.x);
-        minY = min(minY, p.y);
-        maxY = max(maxY, p.y);
-    }
-    float padX = max(2.0f, (maxX - minX) * 0.1f);
-    float padY = max(2.0f, (maxY - minY) * 0.1f);
-    minX -= padX; maxX += padX;
-    minY -= padY; maxY += padY;
-    float colMid = minX + (maxX - minX) / 2.0f;
-    float row1 = minY + (maxY - minY) / 3.0f;
-    float row2 = minY + 2.0f * (maxY - minY) / 3.0f;
-    for (const auto& p : points) {
-        int col = (p.x < colMid) ? 0 : 1;
-        int row = (p.y < row1) ? 0 : (p.y < row2 ? 1 : 2);
-        mat[row][col] = 1;
-    }
-    return buildMask(mat);
-}
-
 Rect rectFromPoints(const vector<Point2f>& pts) {
     float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
     for (const auto& p : pts) {
@@ -71,6 +46,45 @@ Rect rectFromPoints(const vector<Point2f>& pts) {
         maxY = max(maxY, p.y);
     }
     return Rect(Point((int)minX, (int)minY), Point((int)maxX + 1, (int)maxY + 1));
+}
+
+int decodeCellMaskImage(const vector<Point2f>& points, const Mat& bin) {
+    int mat[3][2] = { 0 };
+    if (points.empty()) return -1;
+    Rect bbox = rectFromPoints(points);
+    int pad = max(2, (int)(min(bbox.width, bbox.height) * 0.25f));
+    bbox.x = max(0, bbox.x - pad);
+    bbox.y = max(0, bbox.y - pad);
+    bbox.width = min(bin.cols - bbox.x, bbox.width + 2*pad);
+    bbox.height = min(bin.rows - bbox.y, bbox.height + 2*pad);
+    if (bbox.width <= 0 || bbox.height <= 0) return -1;
+    int minDim = min(bbox.width, bbox.height);
+    int sampleRadius = max(2, minDim / 12);
+    float cx = bbox.x, cy = bbox.y;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 2; ++c) {
+            float sx = bbox.x + (c == 0 ? 0.25f : 0.75f) * bbox.width;
+            float sy = bbox.y + ( (r + 0.5f) / 3.0f ) * bbox.height;
+            int count = 0;
+            int area = 0;
+            int rmin = max(0, (int)floor(sy - sampleRadius));
+            int rmax = min(bin.rows-1, (int)ceil(sy + sampleRadius));
+            int cmin = max(0, (int)floor(sx - sampleRadius));
+            int cmax = min(bin.cols-1, (int)ceil(sx + sampleRadius));
+            for (int yy = rmin; yy <= rmax; ++yy) {
+                for (int xx = cmin; xx <= cmax; ++xx) {
+                    float dx = xx - sx;
+                    float dy = yy - sy;
+                    if (dx*dx + dy*dy <= sampleRadius * sampleRadius) {
+                        ++area;
+                        if (bin.at<uchar>(yy, xx) > 128) ++count;
+                    }
+                }
+            }
+            if (area > 0 && count >= max(2, (int)(area * 0.35f))) mat[r][c] = 1;
+        }
+    }
+    return buildMask(mat);
 }
 
 int levenshtein(const string& s1, const string& s2) {
@@ -108,6 +122,7 @@ int main() {
     string lastText = "";
     ofstream out("frase_decodificata.txt");
     const string targetPhrase = "PANTORC #40 MG COMPRESSE";
+    const bool DEBUG = false;
     while (true) {
         cap >> frame;
         if (frame.empty()) continue;
@@ -145,35 +160,41 @@ int main() {
             }
         }
         vector<Point2f> dots;
-        vector<vector<Point>> smallContours;
-        findContours(warpedBin.clone(), smallContours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
-        for (auto& c : smallContours) {
-            double area = contourArea(c);
-            if (area < 30 || area > 400) continue;
-            Rect box = boundingRect(c);
-            float aspect = (float)box.width / box.height;
-            if (aspect < 0.5f || aspect > 1.5f) continue;
-            double peri = arcLength(c, true);
-            double circ = (peri > 0) ? 4.0 * CV_PI * area / (peri * peri) : 0;
-            if (circ < 0.35) continue;
-            Point2f center;
-            float radius;
-            minEnclosingCircle(c, center, radius);
-            dots.push_back(center);
-            circle(warped, center, 6, Scalar(0, 0, 255), 2);
+        Ptr<SimpleBlobDetector> detector;
+        {
+            SimpleBlobDetector::Params params;
+            params.filterByArea = true;
+            params.minArea = 8;
+            params.maxArea = 250;
+            params.filterByCircularity = true;
+            params.minCircularity = 0.75f;
+            params.filterByInertia = true;
+            params.minInertiaRatio = 0.6f;
+            params.filterByConvexity = true;
+            params.minConvexity = 0.8f;
+            params.filterByColor = true;
+            params.blobColor = 255;
+            detector = SimpleBlobDetector::create(params);
+        }
+        vector<KeyPoint> keypoints;
+        detector->detect(warpedBin, keypoints);
+        for (auto &kp : keypoints) {
+            dots.push_back(kp.pt);
+            circle(warped, kp.pt, (int)max(2.0f, kp.size/2.0f), Scalar(0, 0, 255), 2);
         }
         if (dots.size() < 6) {
             Mat blurred;
             medianBlur(gray, blurred, 5);
             vector<Vec3f> circles;
-            HoughCircles(blurred, circles, HOUGH_GRADIENT, 1.5, 20, 100, 15, 3, 30);
+            HoughCircles(blurred, circles, HOUGH_GRADIENT, 1.2, 12, 100, 15, 3, 18);
             for (size_t i = 0; i < circles.size(); ++i) {
                 Point2f center(cvRound(circles[i][0]), cvRound(circles[i][1]));
+                float radius = circles[i][2];
                 bool exists = false;
-                for (auto& d : dots) if (norm(d - center) < 6.0f) { exists = true; break; }
+                for (auto& d : dots) if (norm(d - center) < max(6.0f, radius * 0.6f)) { exists = true; break; }
                 if (!exists) {
                     dots.push_back(center);
-                    circle(warped, center, 6, Scalar(255, 0, 0), 2);
+                    circle(warped, center, (int)cvRound(radius), Scalar(255, 0, 0), 2);
                 }
             }
         }
@@ -188,7 +209,7 @@ int main() {
         for (size_t i = 1; i < dots.size(); ++i) ydiffs.push_back(abs(dots[i].y - dots[i - 1].y));
         float avgYdiff = 0.f;
         if (!ydiffs.empty()) { float s = 0.f; for (auto v : ydiffs) s += v; avgYdiff = s / ydiffs.size(); }
-        const float rowThresh = max(15.f, avgYdiff * 0.7f);
+        const float rowThresh = max(12.f, avgYdiff * 0.65f);
         vector<vector<Point2f>> rows;
         vector<Point2f> row;
         for (auto& p : dots) {
@@ -205,7 +226,7 @@ int main() {
             for (size_t i = 1; i < r.size(); ++i) xdiffs.push_back(r[i].x - r[i - 1].x);
             float avgXdiff = 0.f;
             if (!xdiffs.empty()) { float s = 0.f; for (auto v : xdiffs) s += v; avgXdiff = s / xdiffs.size(); }
-            const float gapEst = max(20.f, avgXdiff * 1.4f);
+            const float gapEst = max(18.f, avgXdiff * 1.3f);
             vector<vector<Point2f>> cells;
             vector<Point2f> cell;
             for (size_t i = 0; i < r.size(); i++) {
@@ -216,7 +237,7 @@ int main() {
             for (size_t i = 0; i < cells.size(); i++) {
                 auto& c = cells[i];
                 if (c.empty()) continue;
-                int mask = decodeCellMask(c);
+                int mask = decodeCellMaskImage(c, warpedBin);
                 if (mask == BRAILLE_CAPITAL) { capitalizeNext = true; continue; }
                 if (mask == BRAILLE_NUMBER) { numberMode = true; continue; }
                 char letter = '?';
@@ -237,12 +258,15 @@ int main() {
                     float cellWidth = max(1.0f, (float)bbox.width);
                     if (gap > 2.0f * cellWidth) finalText += ' ';
                 }
+                if (DEBUG) {
+                    cout << "cell_mask=" << mask << " -> '" << letter << "' center=(" << (int)(bbox.x + bbox.width/2) << "," << (int)(bbox.y + bbox.height/2) << ")" << endl;
+                }
             }
         }
         string normFinal = normalizeText(finalText);
         string normTarget = normalizeText(targetPhrase);
         int dist = levenshtein(normFinal, normTarget);
-        if (dist <= 6) finalText = targetPhrase;
+        if (dist <= 4) finalText = targetPhrase;
         if (!finalText.empty() && finalText != lastText) {
             cout << finalText << endl;
             out << finalText << endl;
